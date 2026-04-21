@@ -32,6 +32,32 @@ artifacts:
         username: gituser
         password: gitpassword
 
+aws:
+  enabled: true
+  accessKeyId: AKIAIOSFODNN7EXAMPLE
+  secretAccessKey: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  # availabilityZones must be set to prevent live EC2 describeAvailabilityZones
+  # calls during startup — those would fail with fake credentials and cause the
+  # account to be silently dropped from the credentials repository.
+  defaultRegions:
+    - name: us-east-1
+      availabilityZones:
+        - us-east-1a
+        - us-east-1b
+        - us-east-1c
+  accounts:
+    - name: prod-aws
+      accountId: '123456789012'
+      environment: production
+      accountType: main
+      assumeRole: role/SpinnakerManaged
+      regions:
+        - name: us-east-1
+          availabilityZones:
+            - us-east-1a
+            - us-east-1b
+            - us-east-1c
+
 # Elasticsearch for entity tags
 resilience4j.retry.instances.default:
   maxAttempts: 1
