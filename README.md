@@ -2,6 +2,10 @@
 
 Proof-of-concept demonstrations for CVE-2026-32604 and CVE-2026-32613, two 10.0 severity vulnerabilities in Spinnaker that allow for code execution and production cloud credential theft.
 
+- [Video walkthrough of how to use these POCS](https://youtu.be/ma-00ggxSp4)
+- [Technical blog with more details](https://zeropath.com/blog/spinnaker-rce-production-compromise)
+
+
 ## Vulnerabilities
 
 ### Git Clone Shell Injection (CVE-2026-32604, CWE-78)
